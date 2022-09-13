@@ -145,8 +145,6 @@ jest.mock("xdg-app-paths", () => {
 	};
 });
 
-jest.mock("create-cloudflare");
-
 jest.mock("../metrics/metrics-config", () => {
 	const realModule = jest.requireActual("../metrics/metrics-config");
 	const fakeModule = {
