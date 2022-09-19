@@ -33,7 +33,7 @@ import type {
 } from "../worker";
 import type { EsbuildBundle } from "./use-esbuild";
 
-export function Remote(props: {
+interface RemoteProps {
 	name: string | undefined;
 	bundle: EsbuildBundle | undefined;
 	format: CfScriptFormat | undefined;
@@ -57,7 +57,9 @@ export function Remote(props: {
 	onReady?: ((ip: string, port: number) => void) | undefined;
 	sourceMapPath: string | undefined;
 	sendMetrics: boolean | undefined;
-}) {
+}
+
+export function Remote(props: RemoteProps) {
 	const [accountId, setAccountId] = useState(props.accountId);
 	const accountChoicesRef = useRef<Promise<ChooseAccountItem[]>>();
 	const [accountChoices, setAccountChoices] = useState<ChooseAccountItem[]>();
@@ -148,7 +150,7 @@ export function Remote(props: {
 	) : null;
 }
 
-export function useWorker(props: {
+interface RemoteWorkerProps {
 	name: string | undefined;
 	bundle: EsbuildBundle | undefined;
 	format: CfScriptFormat | undefined;
@@ -168,7 +170,11 @@ export function useWorker(props: {
 	onReady: ((ip: string, port: number) => void) | undefined;
 	sendMetrics: boolean | undefined;
 	port: number;
-}): CfPreviewToken | undefined {
+}
+
+export function useWorker(
+	props: RemoteWorkerProps
+): CfPreviewToken | undefined {
 	const [session, setSession] = useState<CfPreviewSession | undefined>();
 	const [token, setToken] = useState<CfPreviewToken | undefined>();
 	const [restartCounter, setRestartCounter] = useState<number>(0);
@@ -185,25 +191,20 @@ export function useWorker(props: {
 			if (props.accountId === undefined) {
 				return;
 			}
-
-			const workerAccount: CfAccount = {
+			const { workerAccount, workerContext } = getWorkerAccountAndContext({
 				accountId: props.accountId,
-				apiToken: requireApiToken(),
-			};
-
-			const workerCtx: CfWorkerContext = {
 				env: props.env,
 				legacyEnv: props.legacyEnv,
 				zone: props.zone,
 				host: props.host,
 				routes: props.routes,
 				sendMetrics: props.sendMetrics,
-			};
+			});
 
 			setSession(
 				await createPreviewSession(
 					workerAccount,
-					workerCtx,
+					workerContext,
 					abortController.signal
 				)
 			);
@@ -249,83 +250,36 @@ export function useWorker(props: {
 			} else {
 				logger.log("⎔ Detected changes, restarted server.");
 			}
-
-			const content = await readFile(props.bundle.path, "utf-8");
-
-			// TODO: For Dev we could show the reporter message in the interactive box.
-			void printBundleSize(
-				{ name: path.basename(props.bundle.path), content: content },
-				props.modules
-			);
-
-			const assets = await syncAssets(
-				props.accountId,
-				// When we're using the newer service environments, we wouldn't
-				// have added the env name on to the script name. However, we must
-				// include it in the kv namespace name regardless (since there's no
-				// concept of service environments for kv namespaces yet).
-				props.name + (!props.legacyEnv && props.env ? `-${props.env}` : ""),
-				props.isWorkersSite ? props.assetPaths : undefined,
-				true,
-				false
-			); // TODO: cancellable?
-
-			const init: CfWorkerInit = {
-				name: props.name,
-				main: {
-					name: path.basename(props.bundle.path),
-					type: props.format === "modules" ? "esm" : "commonjs",
-					content,
-				},
-				modules: props.modules.concat(
-					assets.manifest
-						? {
-								name: "__STATIC_CONTENT_MANIFEST",
-								content: JSON.stringify(assets.manifest),
-								type: "text",
-						  }
-						: []
-				),
-				bindings: {
-					...props.bindings,
-					kv_namespaces: (props.bindings.kv_namespaces || []).concat(
-						assets.namespace
-							? { binding: "__STATIC_CONTENT", id: assets.namespace }
-							: []
-					),
-					text_blobs: {
-						...props.bindings.text_blobs,
-						...(assets.manifest &&
-							props.format === "service-worker" && {
-								__STATIC_CONTENT_MANIFEST: "__STATIC_CONTENT_MANIFEST",
-							}),
-					},
-				},
-				migrations: undefined, // no migrations in dev
-				compatibility_date: props.compatibilityDate,
-				compatibility_flags: props.compatibilityFlags,
-				usage_model: props.usageModel,
-				keep_bindings: true,
-			};
-
-			const workerAccount: CfAccount = {
+			const init = await createRemoteWorkerInit({
+				bundle: props.bundle,
+				modules: props.modules,
 				accountId: props.accountId,
-				apiToken: requireApiToken(),
-			};
+				name: props.name,
+				legacyEnv: props.legacyEnv,
+				env: props.env,
+				isWorkersSite: props.isWorkersSite,
+				assetPaths: props.assetPaths,
+				format: props.format,
+				bindings: props.bindings,
+				compatibilityDate: props.compatibilityDate,
+				compatibilityFlags: props.compatibilityFlags,
+				usageModel: props.usageModel,
+			});
 
-			const workerCtx: CfWorkerContext = {
+			const { workerAccount, workerContext } = getWorkerAccountAndContext({
+				accountId: props.accountId,
 				env: props.env,
 				legacyEnv: props.legacyEnv,
 				zone: props.zone,
 				host: props.host,
 				routes: props.routes,
 				sendMetrics: props.sendMetrics,
-			};
+			});
 
 			const workerPreviewToken = await createWorkerPreview(
 				init,
 				workerAccount,
-				workerCtx,
+				workerContext,
 				session,
 				abortController.signal
 			);
@@ -410,4 +364,106 @@ export function useWorker(props: {
 	]);
 
 	return token;
+}
+
+async function createRemoteWorkerInit(props: {
+	bundle: EsbuildBundle;
+	modules: CfModule[];
+	accountId: string;
+	name: string | undefined;
+	legacyEnv: boolean | undefined;
+	env: string | undefined;
+	isWorkersSite: boolean;
+	assetPaths: AssetPaths | undefined;
+	format: CfScriptFormat;
+	bindings: CfWorkerInit["bindings"];
+	compatibilityDate: string | undefined;
+	compatibilityFlags: string[] | undefined;
+	usageModel: "bundled" | "unbound" | undefined;
+}) {
+	const content = await readFile(props.bundle.path, "utf-8");
+
+	// TODO: For Dev we could show the reporter message in the interactive box.
+	void printBundleSize(
+		{ name: path.basename(props.bundle.path), content: content },
+		props.modules
+	);
+
+	const assets = await syncAssets(
+		props.accountId,
+		// When we're using the newer service environments, we wouldn't
+		// have added the env name on to the script name. However, we must
+		// include it in the kv namespace name regardless (since there's no
+		// concept of service environments for kv namespaces yet).
+		props.name + (!props.legacyEnv && props.env ? `-${props.env}` : ""),
+		props.isWorkersSite ? props.assetPaths : undefined,
+		true,
+		false
+	); // TODO: cancellable?
+
+	const init: CfWorkerInit = {
+		name: props.name,
+		main: {
+			name: path.basename(props.bundle.path),
+			type: props.format === "modules" ? "esm" : "commonjs",
+			content,
+		},
+		modules: props.modules.concat(
+			assets.manifest
+				? {
+						name: "__STATIC_CONTENT_MANIFEST",
+						content: JSON.stringify(assets.manifest),
+						type: "text",
+				  }
+				: []
+		),
+		bindings: {
+			...props.bindings,
+			kv_namespaces: (props.bindings.kv_namespaces || []).concat(
+				assets.namespace
+					? { binding: "__STATIC_CONTENT", id: assets.namespace }
+					: []
+			),
+			text_blobs: {
+				...props.bindings.text_blobs,
+				...(assets.manifest &&
+					props.format === "service-worker" && {
+						__STATIC_CONTENT_MANIFEST: "__STATIC_CONTENT_MANIFEST",
+					}),
+			},
+		},
+		migrations: undefined, // no migrations in dev
+		compatibility_date: props.compatibilityDate,
+		compatibility_flags: props.compatibilityFlags,
+		usage_model: props.usageModel,
+		keep_bindings: true,
+	};
+
+	return init;
+}
+
+function getWorkerAccountAndContext(props: {
+	accountId: string;
+	env?: string;
+	legacyEnv?: boolean;
+	zone?: string;
+	host?: string;
+	routes: Route[] | undefined;
+	sendMetrics?: boolean;
+}): { workerAccount: CfAccount; workerContext: CfWorkerContext } {
+	const workerAccount: CfAccount = {
+		accountId: props.accountId,
+		apiToken: requireApiToken(),
+	};
+
+	const workerContext: CfWorkerContext = {
+		env: props.env,
+		legacyEnv: props.legacyEnv,
+		zone: props.zone,
+		host: props.host,
+		routes: props.routes,
+		sendMetrics: props.sendMetrics,
+	};
+
+	return { workerAccount, workerContext };
 }
